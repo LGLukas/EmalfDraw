@@ -1,15 +1,16 @@
-from fastapi import FastAPI, APIRouter
+from fastapi import FastAPI, APIRouter, HTTPException
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 import os
 import logging
 from pathlib import Path
-from pydantic import BaseModel, Field
 from typing import List
-import uuid
+import random
 from datetime import datetime
 
+from models import DrawingIdea, DrawingIdeaCreate, DrawingIdeaResponse
+from data import DEFAULT_DRAWING_IDEAS
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -25,32 +26,114 @@ app = FastAPI()
 # Create a router with the /api prefix
 api_router = APIRouter(prefix="/api")
 
+# Seed default ideas on startup
+async def seed_default_ideas():
+    """Seed the database with default drawing ideas if not already present"""
+    try:
+        # Check if we already have ideas
+        existing_count = await db.drawing_ideas.count_documents({})
+        if existing_count > 0:
+            return
+        
+        # Insert default ideas
+        default_ideas = []
+        for idea_text in DEFAULT_DRAWING_IDEAS:
+            idea = DrawingIdea(
+                text=idea_text,
+                user_submitted=False,
+                created_at=datetime.utcnow()
+            )
+            default_ideas.append(idea.dict())
+        
+        await db.drawing_ideas.insert_many(default_ideas)
+        logger.info(f"Seeded {len(default_ideas)} default drawing ideas")
+    except Exception as e:
+        logger.error(f"Error seeding default ideas: {e}")
 
-# Define Models
-class StatusCheck(BaseModel):
-    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    client_name: str
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
+# Drawing Ideas Routes
+@api_router.get("/ideas", response_model=List[DrawingIdeaResponse])
+async def get_all_ideas():
+    """Get all drawing ideas"""
+    try:
+        ideas = await db.drawing_ideas.find().sort("created_at", -1).to_list(1000)
+        return [DrawingIdeaResponse(**idea) for idea in ideas]
+    except Exception as e:
+        logger.error(f"Error fetching ideas: {e}")
+        raise HTTPException(status_code=500, detail="Failed to fetch ideas")
 
-class StatusCheckCreate(BaseModel):
-    client_name: str
+@api_router.get("/ideas/random", response_model=DrawingIdeaResponse)
+async def get_random_idea():
+    """Get a random drawing idea"""
+    try:
+        # Get total count
+        total = await db.drawing_ideas.count_documents({})
+        if total == 0:
+            raise HTTPException(status_code=404, detail="No ideas available")
+        
+        # Get random idea using aggregation
+        pipeline = [{"$sample": {"size": 1}}]
+        cursor = db.drawing_ideas.aggregate(pipeline)
+        random_idea = await cursor.to_list(length=1)
+        
+        if not random_idea:
+            raise HTTPException(status_code=404, detail="No ideas available")
+        
+        return DrawingIdeaResponse(**random_idea[0])
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching random idea: {e}")
+        raise HTTPException(status_code=500, detail="Failed to fetch random idea")
 
-# Add your routes to the router instead of directly to app
+@api_router.post("/ideas", response_model=DrawingIdeaResponse)
+async def create_idea(idea_input: DrawingIdeaCreate):
+    """Create a new drawing idea"""
+    try:
+        # Check if idea already exists (case-insensitive)
+        existing = await db.drawing_ideas.find_one({
+            "text": {"$regex": f"^{idea_input.text.strip()}$", "$options": "i"}
+        })
+        if existing:
+            raise HTTPException(status_code=409, detail="This idea already exists")
+        
+        # Create new idea
+        new_idea = DrawingIdea(
+            text=idea_input.text.strip(),
+            user_submitted=True,
+            created_at=datetime.utcnow()
+        )
+        
+        # Insert to database
+        result = await db.drawing_ideas.insert_one(new_idea.dict())
+        if not result.inserted_id:
+            raise HTTPException(status_code=500, detail="Failed to create idea")
+        
+        return DrawingIdeaResponse(**new_idea.dict())
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error creating idea: {e}")
+        raise HTTPException(status_code=500, detail="Failed to create idea")
+
+# Health check route
 @api_router.get("/")
 async def root():
-    return {"message": "Hello World"}
+    return {"message": "EmalfDraw API is running!"}
 
-@api_router.post("/status", response_model=StatusCheck)
-async def create_status_check(input: StatusCheckCreate):
-    status_dict = input.dict()
-    status_obj = StatusCheck(**status_dict)
-    _ = await db.status_checks.insert_one(status_obj.dict())
-    return status_obj
-
-@api_router.get("/status", response_model=List[StatusCheck])
-async def get_status_checks():
-    status_checks = await db.status_checks.find().to_list(1000)
-    return [StatusCheck(**status_check) for status_check in status_checks]
+@api_router.get("/health")
+async def health_check():
+    """Health check endpoint"""
+    try:
+        # Test database connection
+        await db.command("ping")
+        idea_count = await db.drawing_ideas.count_documents({})
+        return {
+            "status": "healthy",
+            "database": "connected",
+            "ideas_count": idea_count
+        }
+    except Exception as e:
+        return {"status": "unhealthy", "error": str(e)}
 
 # Include the router in the main app
 app.include_router(api_router)
