@@ -153,6 +153,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+@app.on_event("startup")
+async def startup_event():
+    """Seed default ideas on startup"""
+    await seed_default_ideas()
+
 @app.on_event("shutdown")
 async def shutdown_db_client():
     client.close()
